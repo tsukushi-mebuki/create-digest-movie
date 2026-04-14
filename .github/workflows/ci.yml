@@ -75,6 +75,21 @@ jobs:
           docker compose logs api
           exit 1
 
+      - name: Run Drive connectivity smoke test
+        run: |
+          for i in {1..5}; do
+            if docker compose exec -T api php /var/www/tests/run_drive_connectivity_smoke_test.php; then
+              exit 0
+            fi
+            echo "Drive connectivity smoke test failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Drive connectivity smoke test failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
       - name: Tear down
         if: always()
         run: docker compose down -v
