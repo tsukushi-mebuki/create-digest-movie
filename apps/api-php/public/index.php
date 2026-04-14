@@ -24,6 +24,16 @@ try {
         return;
     }
 
+    if ($method === 'POST' && $path === '/api/jobs/dispatch') {
+        handleDispatch($repository);
+        return;
+    }
+
+    if ($method === 'POST' && $path === '/api/webhooks/github') {
+        handleGithubWebhook($repository);
+        return;
+    }
+
     respondJson(404, ['error' => 'Not found']);
 } catch (\Throwable $e) {
     respondJson(500, ['error' => 'Internal server error', 'detail' => $e->getMessage()]);
@@ -83,6 +93,127 @@ function handleGetJob(JobRepository $repository, string $jobId): void
     }
 
     respondJson(200, $job);
+}
+
+/**
+ * Why: dispatch must be idempotent by job status to avoid duplicate pipeline starts.
+ */
+function handleDispatch(JobRepository $repository): void
+{
+    $payload = readJsonBody();
+    $jobId = requireString($payload, 'job_id');
+
+    $outcome = $repository->dispatchIfAllowed($jobId, static function (string $targetJobId): void {
+        dispatchGithubWorkflow($targetJobId);
+    });
+
+    if ($outcome === 'not_found') {
+        respondJson(404, ['error' => 'Job not found']);
+        return;
+    }
+
+    if ($outcome === 'skipped') {
+        respondJson(200, ['status' => 'skipped']);
+        return;
+    }
+
+    respondJson(200, ['status' => 'accepted']);
+}
+
+/**
+ * Why: Webhook endpoint enforces signature + timestamp window against replay attacks.
+ */
+function handleGithubWebhook(JobRepository $repository): void
+{
+    $rawBody = readRawBody();
+    verifyWebhookSignatureAndTimestamp($rawBody);
+
+    $payload = decodeJsonBody($rawBody);
+    $jobId = requireString($payload, 'job_id');
+    $status = requireJobStatus($payload, 'status');
+    $assets = optionalAssocArray($payload, 'assets');
+    $completedAt = optionalString($payload, 'completed_at');
+
+    $outcome = $repository->applyWebhookUpdate($jobId, $status, $assets, $completedAt);
+    if ($outcome === 'not_found') {
+        respondJson(404, ['error' => 'Job not found']);
+        return;
+    }
+
+    if ($outcome === 'skipped') {
+        respondJson(200, ['status' => 'ignored']);
+        return;
+    }
+
+    respondJson(200, ['status' => 'ok']);
+}
+
+function dispatchGithubWorkflow(string $jobId): void
+{
+    $endpoint = getenv('GITHUB_DISPATCH_ENDPOINT');
+    if ($endpoint === false || trim($endpoint) === '') {
+        $owner = requiredEnv('GITHUB_REPO_OWNER');
+        $repo = requiredEnv('GITHUB_REPO_NAME');
+        $workflow = getenv('GITHUB_WORKFLOW_FILE');
+        if ($workflow === false || trim($workflow) === '') {
+            $workflow = 'pipeline-transcribe.yml';
+        }
+        $endpoint = sprintf(
+            'https://api.github.com/repos/%s/%s/actions/workflows/%s/dispatches',
+            rawurlencode($owner),
+            rawurlencode($repo),
+            rawurlencode($workflow)
+        );
+    }
+
+    $token = requiredEnv('GITHUB_TOKEN');
+    $ref = getenv('GITHUB_DISPATCH_REF');
+    if ($ref === false || trim($ref) === '') {
+        $ref = 'master';
+    }
+
+    $body = json_encode([
+        'ref' => $ref,
+        'inputs' => ['job_id' => $jobId],
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if (!is_string($body)) {
+        throw new \RuntimeException('Failed to encode GitHub dispatch payload.');
+    }
+
+    if (!function_exists('curl_init')) {
+        throw new \RuntimeException('cURL extension is required for GitHub dispatch.');
+    }
+
+    $ch = curl_init($endpoint);
+    if ($ch === false) {
+        throw new \RuntimeException('Failed to initialize cURL for GitHub dispatch.');
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/vnd.github+json',
+            'Authorization: Bearer ' . $token,
+            'X-GitHub-Api-Version: 2022-11-28',
+            'User-Agent: create-digest-movie-dispatcher',
+            'Content-Type: application/json',
+        ],
+        CURLOPT_POSTFIELDS => $body,
+        CURLOPT_RETURNTRANSFER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    if ($response === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        throw new \RuntimeException('GitHub dispatch request failed: ' . $error);
+    }
+
+    $statusCode = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($statusCode < 200 || $statusCode >= 300) {
+        throw new \RuntimeException('GitHub dispatch returned HTTP ' . $statusCode);
+    }
 }
 
 /**
@@ -245,17 +376,58 @@ function base64UrlEncode(string $value): string
 
 function readJsonBody(): array
 {
+    $raw = readRawBody();
+    return decodeJsonBody($raw);
+}
+
+function readRawBody(): string
+{
     $raw = file_get_contents('php://input');
     if ($raw === false || $raw === '') {
         throw new \RuntimeException('Request body is required.');
     }
 
-    $decoded = json_decode($raw, true);
+    return $raw;
+}
+
+function decodeJsonBody(string $rawBody): array
+{
+    $decoded = json_decode($rawBody, true);
     if (!is_array($decoded)) {
         throw new \RuntimeException('Request body must be valid JSON object.');
     }
 
     return $decoded;
+}
+
+/**
+ * Why: replayed requests must fail if timestamp exceeds 5 minute tolerance.
+ */
+function verifyWebhookSignatureAndTimestamp(string $rawBody): void
+{
+    $signature = getRequiredHeader('X-Hub-Signature-256', 'HTTP_X_HUB_SIGNATURE_256');
+    $timestamp = getRequiredHeader('X-Webhook-Timestamp', 'HTTP_X_WEBHOOK_TIMESTAMP');
+    if (!preg_match('/^\d+$/', $timestamp)) {
+        respondJson(401, ['error' => 'Unauthorized']);
+        exit;
+    }
+
+    $timestampInt = (int) $timestamp;
+    if (abs(time() - $timestampInt) > 300) {
+        respondJson(401, ['error' => 'Unauthorized']);
+        exit;
+    }
+
+    $secret = getenv('GITHUB_WEBHOOK_SECRET');
+    if ($secret === false || trim($secret) === '') {
+        $secret = requiredEnv('WEBHOOK_SECRET');
+    }
+
+    $expected = 'sha256=' . hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
+    if (!hash_equals($expected, $signature)) {
+        respondJson(401, ['error' => 'Unauthorized']);
+        exit;
+    }
 }
 
 function requireString(array $payload, string $key): string
@@ -276,6 +448,58 @@ function requireArray(array $payload, string $key): array
     }
 
     return $value;
+}
+
+function optionalAssocArray(array $payload, string $key): ?array
+{
+    if (!array_key_exists($key, $payload) || $payload[$key] === null) {
+        return null;
+    }
+    if (!is_array($payload[$key])) {
+        throw new RuntimeException(sprintf('%s must be an object when provided.', $key));
+    }
+
+    return $payload[$key];
+}
+
+function optionalString(array $payload, string $key): ?string
+{
+    if (!array_key_exists($key, $payload) || $payload[$key] === null) {
+        return null;
+    }
+    if (!is_string($payload[$key]) || trim($payload[$key]) === '') {
+        throw new RuntimeException(sprintf('%s must be a non-empty string when provided.', $key));
+    }
+
+    return trim((string) $payload[$key]);
+}
+
+function requireJobStatus(array $payload, string $key): string
+{
+    $status = requireString($payload, $key);
+    $allowed = [
+        JobStatus::PENDING,
+        JobStatus::UPLOADING,
+        JobStatus::ANALYZING,
+        JobStatus::EDITING,
+        JobStatus::COMPLETED,
+        JobStatus::FAILED,
+    ];
+    if (!in_array($status, $allowed, true)) {
+        throw new RuntimeException(sprintf('%s has unsupported value.', $key));
+    }
+
+    return $status;
+}
+
+function getRequiredHeader(string $canonical, string $serverKey): string
+{
+    $value = $_SERVER[$serverKey] ?? null;
+    if (!is_string($value) || trim($value) === '') {
+        throw new RuntimeException(sprintf('%s header is required.', $canonical));
+    }
+
+    return trim($value);
 }
 
 function normalizedSettingsHash(array $settings): string

@@ -75,6 +75,36 @@ jobs:
           docker compose logs api
           exit 1
 
+      - name: Run Issue #3 quality tests
+        run: |
+          for i in {1..10}; do
+            if docker compose exec -T api php /var/www/tests/run_issue3_quality_tests.php; then
+              exit 0
+            fi
+            echo "Issue #3 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #3 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
+      - name: Run Issue #4 quality tests
+        run: |
+          for i in {1..10}; do
+            if docker compose exec -T api php /var/www/tests/run_issue4_quality_tests.php; then
+              exit 0
+            fi
+            echo "Issue #4 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #4 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
       - name: Run Drive connectivity smoke test
         run: |
           for i in {1..5}; do
