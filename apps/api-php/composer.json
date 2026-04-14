@@ -1,5 +1,10 @@
 {
   "name": "create-digest-movie/api-php",
   "type": "project",
-  "require": {}
+  "require": {},
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
 }
