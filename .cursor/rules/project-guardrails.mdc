@@ -1,0 +1,46 @@
+---
+description: create-digest-movieの実装不変条件と改変ガード
+alwaysApply: true
+---
+
+# Project Guardrails
+
+## アーキテクチャ不変条件
+- Frontendは`Next.js(App Router)+TypeScript+Tailwind+Uppy.js`を使用する。
+- BFF/APIは`PHP 8.x + PDO`を使用し、フロントから秘密情報付き外部APIを直接叩かない。
+- 解析パイプラインは`GitHub Actions(Python: faster-whisper/librosa/FFmpeg)`で実装する。
+
+## データ契約
+- `video_jobs`の主要列は`job_id, source_job_id, file_hash, settings_hash, status, asset_integrity, completed_at`を維持する。
+- `settings_hash`はフロント受信値を信用せず、バックエンドで正規化JSONから再計算する。
+- `assets`は`original_video_id, text_asset_id, completed_shorts`を契約キーとして扱う。
+- `assets`更新は全置換禁止。必ず部分マージで更新する。
+
+## 状態遷移とライフサイクル
+- 許可遷移は`pending -> uploading -> analyzing -> editing -> completed`。
+- 異常時のみ`failed`への遷移を許可する。
+- 例外として重複完全一致時のみ`pending -> completed`を許可する。
+- `completed`/`failed`到達後の逆行更新は禁止する。
+- 元動画削除の起点は`created_at`ではなく`completed_at`とする。
+
+## セキュリティ
+- シークレット、トークン、鍵はコードへ直書きせず環境変数のみ使用する。
+- Webhookは`HMAC署名 + timestamp(5分以内) + secret`を検証する。
+- 参照系APIにはレート制限を適用する。
+
+## フロント実装制約
+- 大容量アップロードはUppy.jsの分割転送を使い、`fetch`単発アップロードは禁止する。
+- SHA-256計算はWeb Workerで実行し、5MBチャンク処理と200ms間隔の進捗通知を守る。
+- `upload_url: null`受信時は物理アップロードをバイパスし、仕様どおり次動作へ進む。
+
+## テスト改変ガード（Anti-Patterns）
+- ユーザーの明示許可なく`tests/`配下を都合よく変更して通過させる行為を禁止する。
+- `skip/only`追加、過剰モック化、アサーション緩和による見かけ上の成功を禁止する。
+- Issue範囲外ファイルの編集を禁止する（必要時は事前承認）。
+- 既存ロジックの無断削除や省略記法による欠落を禁止する。
+- API契約・GWT・本ルールの不変条件を実装都合で無断変更しない。
+
+## コメント方針（意味の保全）
+- 全関数コメント強制はしない。自己説明的な小関数には不要。
+- ただし次はコメント必須: 外部I/F、状態遷移、冪等性/重複排除/署名検証、例外分岐。
+- コメントはWhatよりWhyを優先し、制約値（5分/7日/200ms/5MB）の根拠を残す。

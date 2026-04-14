@@ -1,0 +1,4 @@
+name: pipeline-clips
+
+on:
+  workflow_dispatch:

@@ -39,3 +39,51 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# ---- Monorepo common ----
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.log
+logs/
+
+# ---- PHP (apps/api-php) ----
+apps/api-php/vendor/
+apps/api-php/.phpunit.result.cache
+
+# ---- Python (pipelines) ----
+pipelines/.venv/
+pipelines/venv/
+pipelines/__pycache__/
+pipelines/**/*.pyc
+pipelines/.pytest_cache/
+pipelines/.mypy_cache/
+pipelines/.ruff_cache/
+pipelines/.coverage
+pipelines/htmlcov/
+
+# ---- Test artifacts ----
+**/coverage/
+**/playwright-report/
+**/test-results/
+
+# ---- OS / temp ----
+Thumbs.db
+*.tmp
+*.swp
+
+# ---- Secrets / local env overrides ----
+.env
+.env.local
+.env.*.local
+apps/web/.env*
+apps/api-php/.env*
+pipelines/.env*
+!*.example
+
+# ---- Cursor local transient files ----
+.cursor/**/*
+!.cursor/
+!.cursor/rules/
+!.cursor/rules/**/*

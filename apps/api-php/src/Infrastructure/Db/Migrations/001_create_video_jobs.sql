@@ -1,0 +1,2 @@
+-- Scaffold migration placeholder.
+-- Implement video_jobs schema in Issue #1.

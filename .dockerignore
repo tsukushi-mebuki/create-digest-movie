@@ -1,0 +1,16 @@
+.git
+.github
+.next
+node_modules
+**/node_modules
+coverage
+**/coverage
+*.log
+tmp
+.env
+.env.local
+.env.*.local
+apps/web/.env*
+apps/api-php/.env*
+pipelines/.env*
+docker-compose.override.yml

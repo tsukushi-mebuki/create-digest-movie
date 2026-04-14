@@ -1,0 +1,65 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: cdm-web
+    working_dir: /workspace
+    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0 --port 3000"
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./:/workspace
+      - web_node_modules:/workspace/node_modules
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api-php/Dockerfile
+    container_name: cdm-api
+    working_dir: /var/www
+    command: php -S 0.0.0.0:8080 -t public public/router.php
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: development
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: create_digest_movie
+      DB_USER: app
+      DB_PASSWORD: app
+      WEBHOOK_SECRET: dev-webhook-secret
+    volumes:
+      - ./apps/api-php:/var/www
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8.4
+    container_name: cdm-db
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: create_digest_movie
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+      TZ: Asia/Tokyo
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  web_node_modules:
+  db_data:
