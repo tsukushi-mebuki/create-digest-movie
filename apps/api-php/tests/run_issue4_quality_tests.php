@@ -211,6 +211,19 @@ function testAssetsPartialMerge(PDO $pdo, string $secret): void
     assertTrue(($job['assets']['text_asset_id'] ?? null) === 'text-c', 'assets merge must append new keys.');
 }
 
+function testEditingAutoDispatchWiringExists(): void
+{
+    $indexPath = dirname(__DIR__) . '/public/index.php';
+    $content = file_get_contents($indexPath);
+    if (!is_string($content)) {
+        throw new TestFailed('Failed to load API entrypoint for auto-dispatch wiring check.');
+    }
+
+    // Why: editing reached by transcribe webhook must chain clips workflow automatically.
+    assertTrue(str_contains($content, "if (\$status === JobStatus::EDITING)"), 'editing auto-dispatch condition is missing.');
+    assertTrue(str_contains($content, "dispatchGithubWorkflowIfConfigured(\$jobId, 'GITHUB_CLIPS_WORKFLOW_FILE', 'pipeline-clips.yml');"), 'pipeline-clips auto-dispatch call is missing.');
+}
+
 try {
     $secret = getenv('WEBHOOK_SECRET');
     if (!is_string($secret) || trim($secret) === '') {
@@ -227,6 +240,7 @@ try {
     testReplayAttackBlocked($pdo, $secret);
     testReverseTransitionGuard($pdo, $secret);
     testAssetsPartialMerge($pdo, $secret);
+    testEditingAutoDispatchWiringExists();
 
     echo "OK: Issue #4 quality tests passed." . PHP_EOL;
 } catch (Throwable $e) {

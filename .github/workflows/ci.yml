@@ -130,6 +130,21 @@ jobs:
           docker compose logs api
           exit 1
 
+      - name: Run Issue #6 quality tests
+        run: |
+          for i in {1..5}; do
+            if python pipelines/tests/run_issue6_quality_tests.py; then
+              exit 0
+            fi
+            echo "Issue #6 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #6 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
       - name: Run Drive connectivity smoke test
         run: |
           for i in {1..5}; do

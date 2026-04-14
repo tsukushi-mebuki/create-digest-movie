@@ -183,11 +183,19 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
 
-def upload_text_asset(token: str, folder_id: str, file_path: Path, mime_type: str) -> str:
+def upload_text_asset(
+    token: str,
+    folder_id: str,
+    file_path: Path,
+    mime_type: str,
+    app_properties: dict[str, str] | None = None,
+) -> str:
     metadata = {
         "name": file_path.name,
         "parents": [folder_id],
     }
+    if app_properties:
+        metadata["appProperties"] = app_properties
     files = {
         "metadata": ("metadata", json.dumps(metadata), "application/json"),
         "file": (file_path.name, file_path.read_bytes(), mime_type),
@@ -283,8 +291,20 @@ def main() -> None:
         )
         srt_path.write_text(srt_text, encoding="utf-8")
 
-        srt_id = upload_text_asset(token, folder_text_assets, srt_path, "application/x-subrip")
-        json_id = upload_text_asset(token, folder_text_assets, json_path, "application/json")
+        srt_id = upload_text_asset(
+            token,
+            folder_text_assets,
+            srt_path,
+            "application/x-subrip",
+            {"job_id": job_id},
+        )
+        json_id = upload_text_asset(
+            token,
+            folder_text_assets,
+            json_path,
+            "application/json",
+            {"job_id": job_id},
+        )
         print(f"Uploaded transcript.srt to Drive: {srt_id}")
         print(f"Uploaded transcript.json to Drive: {json_id}")
 

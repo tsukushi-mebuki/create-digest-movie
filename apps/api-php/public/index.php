@@ -145,18 +145,48 @@ function handleGithubWebhook(JobRepository $repository): void
         return;
     }
 
+    if ($status === JobStatus::EDITING) {
+        // Why: Once transcript processing marks editing, we must chain clip generation automatically.
+        dispatchGithubWorkflowIfConfigured($jobId, 'GITHUB_CLIPS_WORKFLOW_FILE', 'pipeline-clips.yml');
+    }
+
     respondJson(200, ['status' => 'ok']);
 }
 
 function dispatchGithubWorkflow(string $jobId): void
 {
+    dispatchGithubWorkflowWithWorkflow($jobId, 'GITHUB_WORKFLOW_FILE', 'pipeline-transcribe.yml');
+}
+
+/**
+ * Why: Local/test environments may omit GitHub dispatch secrets; webhook update itself must still succeed.
+ */
+function dispatchGithubWorkflowIfConfigured(string $jobId, string $workflowEnvKey, string $defaultWorkflow): void
+{
+    $token = getenv('GITHUB_TOKEN');
+    $owner = getenv('GITHUB_REPO_OWNER');
+    $repo = getenv('GITHUB_REPO_NAME');
+    $explicitEndpoint = getenv('GITHUB_DISPATCH_ENDPOINT');
+    $hasEndpoint = is_string($explicitEndpoint) && trim($explicitEndpoint) !== '';
+    $hasRepoConfig = is_string($owner) && trim($owner) !== '' && is_string($repo) && trim($repo) !== '';
+    $hasToken = is_string($token) && trim($token) !== '';
+    if ((!$hasEndpoint && !$hasRepoConfig) || !$hasToken) {
+        error_log('GitHub dispatch skipped: missing GITHUB_TOKEN or repository dispatch config.');
+        return;
+    }
+
+    dispatchGithubWorkflowWithWorkflow($jobId, $workflowEnvKey, $defaultWorkflow);
+}
+
+function dispatchGithubWorkflowWithWorkflow(string $jobId, string $workflowEnvKey, string $defaultWorkflow): void
+{
     $endpoint = getenv('GITHUB_DISPATCH_ENDPOINT');
     if ($endpoint === false || trim($endpoint) === '') {
         $owner = requiredEnv('GITHUB_REPO_OWNER');
         $repo = requiredEnv('GITHUB_REPO_NAME');
-        $workflow = getenv('GITHUB_WORKFLOW_FILE');
+        $workflow = getenv($workflowEnvKey);
         if ($workflow === false || trim($workflow) === '') {
-            $workflow = 'pipeline-transcribe.yml';
+            $workflow = $defaultWorkflow;
         }
         $endpoint = sprintf(
             'https://api.github.com/repos/%s/%s/actions/workflows/%s/dispatches',
