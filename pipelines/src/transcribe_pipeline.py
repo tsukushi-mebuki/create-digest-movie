@@ -1,0 +1,297 @@
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+
+
+class RetryableWebhookError(Exception):
+    pass
+
+
+def required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def get_drive_access_token() -> str:
+    from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
+
+    credentials_path = os.getenv("GCP_SERVICE_ACCOUNT_KEY_FILE", "").strip()
+    key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY", "").strip()
+
+    if credentials_path:
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path, scopes=[DRIVE_SCOPE]
+        )
+    elif key_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(key_json), scopes=[DRIVE_SCOPE]
+        )
+    else:
+        raise RuntimeError(
+            "Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided."
+        )
+
+    credentials.refresh(Request())
+    if not credentials.token:
+        raise RuntimeError("Failed to mint Google Drive access token.")
+    return credentials.token
+
+
+def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, Any]:
+    # Why: We bind the picked source file to job_id appProperties for idempotent matching.
+    query = (
+        f"'{folder_id}' in parents and trashed=false and "
+        f"appProperties has {{ key='job_id' and value='{job_id}' }}"
+    )
+    data = drive_get(
+        f"{DRIVE_API_BASE}/files",
+        token,
+        {
+            "q": query,
+            "fields": "files(id,name,size,mimeType,createdTime)",
+            "orderBy": "createdTime desc",
+            "pageSize": 1,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        },
+    )
+    files = data.get("files", [])
+    if not files:
+        raise RuntimeError(f"No source video found in DRIVE_FOLDER_01_ORIGINAL for job_id={job_id}")
+    return files[0]
+
+
+def download_drive_file(token: str, file_id: str, destination: Path) -> None:
+    url = f"{DRIVE_API_BASE}/files/{file_id}"
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "alt": "media",
+            "supportsAllDrives": "true",
+        },
+        stream=True,
+        timeout=600,
+    )
+    response.raise_for_status()
+
+    with destination.open("wb") as output:
+        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+            if chunk:
+                output.write(chunk)
+
+
+def extract_audio(video_path: Path, audio_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(audio_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def report_disk_space(before_free: int, target_dir: Path) -> float:
+    after_free = shutil.disk_usage(target_dir).free
+    freed_gb = (after_free - before_free) / (1024**3)
+    free_gb = after_free / (1024**3)
+    print(f"Free space: {free_gb:.2f} GB")
+    print(f"Freed by source video deletion: {freed_gb:.2f} GB")
+    if freed_gb >= 10:
+        print("Freed space check passed: >= 10 GB released.")
+    else:
+        print("Freed space check warning: released space is below 10 GB.")
+    return free_gb
+
+
+def transcribe(audio_path: Path) -> tuple[list[dict[str, Any]], str]:
+    from faster_whisper import WhisperModel
+
+    model_name = os.getenv("WHISPER_MODEL", "small")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(str(audio_path), beam_size=5)
+
+    records: list[dict[str, Any]] = []
+    srt_chunks: list[str] = []
+    for idx, segment in enumerate(segments, start=1):
+        records.append(
+            {
+                "id": idx,
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text.strip(),
+            }
+        )
+        srt_chunks.append(
+            f"{idx}\n{format_srt_time(segment.start)} --> {format_srt_time(segment.end)}\n{segment.text.strip()}\n"
+        )
+
+    transcript = {
+        "language": info.language,
+        "duration": info.duration,
+        "segments": records,
+    }
+    return [transcript], "\n".join(srt_chunks)
+
+
+def format_srt_time(seconds: float) -> str:
+    millis = int(round(seconds * 1000))
+    hours = millis // 3_600_000
+    millis %= 3_600_000
+    minutes = millis // 60_000
+    millis %= 60_000
+    secs = millis // 1_000
+    ms = millis % 1_000
+    return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
+
+
+def upload_text_asset(token: str, folder_id: str, file_path: Path, mime_type: str) -> str:
+    metadata = {
+        "name": file_path.name,
+        "parents": [folder_id],
+    }
+    files = {
+        "metadata": ("metadata", json.dumps(metadata), "application/json"),
+        "file": (file_path.name, file_path.read_bytes(), mime_type),
+    }
+    response = requests.post(
+        DRIVE_UPLOAD_API,
+        headers={"Authorization": f"Bearer {token}"},
+        params={"supportsAllDrives": "true"},
+        files=files,
+        timeout=300,
+    )
+    response.raise_for_status()
+    data = response.json()
+    file_id = data.get("id")
+    if not isinstance(file_id, str) or not file_id:
+        raise RuntimeError("Failed to upload text asset to Drive.")
+    return file_id
+
+
+def sign_webhook_payload(secret: str, timestamp: str, payload_bytes: bytes) -> str:
+    message = timestamp.encode("utf-8") + b"." + payload_bytes
+    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def build_webhook_payload(job_id: str, original_video_id: str, text_asset_id: str) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "status": "editing",
+        "assets": {
+            "original_video_id": original_video_id,
+            "text_asset_id": text_asset_id,
+        },
+    }
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    retry=retry_if_exception_type((RetryableWebhookError, requests.RequestException)),
+    reraise=True,
+)
+def post_webhook_with_retry(webhook_url: str, secret: str, payload: dict[str, Any]) -> None:
+    timestamp = str(int(time.time()))
+    payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    signature = sign_webhook_payload(secret, timestamp, payload_bytes)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": signature,
+        "X-Webhook-Timestamp": timestamp,
+    }
+    response = requests.post(webhook_url, headers=headers, data=payload_bytes, timeout=30)
+    if response.status_code >= 500:
+        raise RetryableWebhookError(f"Webhook temporary failure: HTTP {response.status_code}")
+    response.raise_for_status()
+
+
+def main() -> None:
+    load_dotenv()
+
+    job_id = required_env("JOB_ID")
+    webhook_url = required_env("WEBHOOK_URL")
+    webhook_secret = required_env("WEBHOOK_SECRET")
+    folder_original = required_env("DRIVE_FOLDER_01_ORIGINAL")
+    folder_text_assets = required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
+    required_env("DRIVE_FOLDER_03_COMPLETED_SHORTS")
+
+    token = get_drive_access_token()
+    source = find_original_video(token, folder_original, job_id)
+    original_video_id = source["id"]
+    source_name = source["name"]
+    print(f"Source video selected: {source_name} ({original_video_id})")
+
+    with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
+        temp_path = Path(temp_dir)
+        video_path = temp_path / source_name
+        audio_path = temp_path / "audio.wav"
+        srt_path = temp_path / "transcript.srt"
+        json_path = temp_path / "transcript.json"
+
+        before_free = shutil.disk_usage(temp_path).free
+        download_drive_file(token, original_video_id, video_path)
+        print(f"Downloaded source video: {video_path}")
+
+        extract_audio(video_path, audio_path)
+        os.remove(video_path)
+        report_disk_space(before_free, temp_path)
+
+        transcripts, srt_text = transcribe(audio_path)
+        json_path.write_text(
+            json.dumps({"job_id": job_id, "results": transcripts}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        srt_path.write_text(srt_text, encoding="utf-8")
+
+        srt_id = upload_text_asset(token, folder_text_assets, srt_path, "application/x-subrip")
+        json_id = upload_text_asset(token, folder_text_assets, json_path, "application/json")
+        print(f"Uploaded transcript.srt to Drive: {srt_id}")
+        print(f"Uploaded transcript.json to Drive: {json_id}")
+
+    payload = build_webhook_payload(job_id, original_video_id, json_id)
+    post_webhook_with_retry(webhook_url, webhook_secret, payload)
+    print("Webhook delivered successfully.")
+
+
+if __name__ == "__main__":
+    main()
