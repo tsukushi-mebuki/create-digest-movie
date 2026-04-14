@@ -2,3 +2,17 @@ name: pipeline-transcribe
 
 on:
   workflow_dispatch:
+    inputs:
+      job_id:
+        description: Target job id
+        required: true
+        type: string
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate dispatch payload
+        run: |
+          echo "pipeline-transcribe dispatched"
+          echo "job_id=${{ github.event.inputs.job_id }}"

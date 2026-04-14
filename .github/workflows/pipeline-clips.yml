@@ -2,3 +2,17 @@ name: pipeline-clips
 
 on:
   workflow_dispatch:
+    inputs:
+      job_id:
+        description: Target job id
+        required: true
+        type: string
+
+jobs:
+  clips:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate dispatch payload
+        run: |
+          echo "pipeline-clips dispatched"
+          echo "job_id=${{ github.event.inputs.job_id }}"
