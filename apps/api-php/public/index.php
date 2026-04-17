@@ -7,12 +7,19 @@ use App\Infrastructure\Repository\JobRepository;
 
 require dirname(__DIR__) . '/bootstrap.php';
 
+applyCorsHeaders();
 header('Content-Type: application/json');
 
 try {
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
     $repository = JobRepository::fromEnv();
+
+    if ($method === 'OPTIONS') {
+        // Why: Browser preflight for cross-origin requests must be accepted before route matching.
+        http_response_code(200);
+        return;
+    }
 
     if ($method === 'POST' && $path === '/api/jobs/init') {
         handleInit($repository);
@@ -82,6 +89,29 @@ function handleInit(JobRepository $repository): void
     $jobId = $repository->createPendingJob($fileHash, $normalizedSettingsHash, $originalFileName, $settings);
     $uploadUrl = createDriveResumableUploadUrl($jobId, $originalFileName);
     respondJson(200, ['job_id' => $jobId, 'upload_url' => $uploadUrl, 'status' => JobStatus::PENDING]);
+}
+
+function applyCorsHeaders(): void
+{
+    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+    if (!is_string($origin) || $origin === '') {
+        return;
+    }
+
+    $allowedOrigins = [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+    ];
+    if (!in_array($origin, $allowedOrigins, true)) {
+        return;
+    }
+
+    header('Vary: Origin');
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Access-Control-Allow-Methods: GET,POST,OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type,X-Webhook-Timestamp,X-Hub-Signature-256');
 }
 
 function handleGetJob(JobRepository $repository, string $jobId): void
@@ -261,6 +291,11 @@ function createDriveResumableUploadUrl(string $jobId, string $originalFileName):
         'name' => $originalFileName,
         'appProperties' => ['job_id' => $jobId],
     ];
+    $originalFolderId = getenv('DRIVE_FOLDER_01_ORIGINAL');
+    if ($originalFolderId !== false && trim($originalFolderId) !== '') {
+        // Why: pipeline-transcribe resolves source by job_id inside the originals folder.
+        $metadata['parents'] = [trim($originalFolderId)];
+    }
 
     if (!function_exists('curl_init')) {
         throw new \RuntimeException('cURL extension is required to create Drive resumable upload URL.');

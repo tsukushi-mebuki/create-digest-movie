@@ -69,7 +69,7 @@ def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
 
 def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, Any]:
     # Why: We bind the picked source file to job_id appProperties for idempotent matching.
-    query = (
+    scoped_query = (
         f"'{folder_id}' in parents and trashed=false and "
         f"appProperties has {{ key='job_id' and value='{job_id}' }}"
     )
@@ -77,8 +77,8 @@ def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, An
         f"{DRIVE_API_BASE}/files",
         token,
         {
-            "q": query,
-            "fields": "files(id,name,size,mimeType,createdTime)",
+            "q": scoped_query,
+            "fields": "files(id,name,size,mimeType,createdTime,parents)",
             "orderBy": "createdTime desc",
             "pageSize": 1,
             "supportsAllDrives": "true",
@@ -86,9 +86,29 @@ def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, An
         },
     )
     files = data.get("files", [])
-    if not files:
-        raise RuntimeError(f"No source video found in DRIVE_FOLDER_01_ORIGINAL for job_id={job_id}")
-    return files[0]
+    if files:
+        return files[0]
+
+    # Why: During local verification, uploads may land outside the configured folder.
+    # Fallback keeps the pipeline moving while still binding by job_id.
+    fallback_query = f"trashed=false and appProperties has {{ key='job_id' and value='{job_id}' }}"
+    fallback = drive_get(
+        f"{DRIVE_API_BASE}/files",
+        token,
+        {
+            "q": fallback_query,
+            "fields": "files(id,name,size,mimeType,createdTime,parents)",
+            "orderBy": "createdTime desc",
+            "pageSize": 1,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        },
+    )
+    fallback_files = fallback.get("files", [])
+    if not fallback_files:
+        raise RuntimeError(f"No source video found in Drive for job_id={job_id}")
+    print("Source video was not in DRIVE_FOLDER_01_ORIGINAL; using fallback search by job_id.")
+    return fallback_files[0]
 
 
 def download_drive_file(token: str, file_id: str, destination: Path) -> None:
