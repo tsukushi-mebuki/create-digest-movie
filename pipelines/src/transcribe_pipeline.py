@@ -36,6 +36,7 @@ def get_drive_access_token() -> str:
 
     credentials_path = os.getenv("GCP_SERVICE_ACCOUNT_KEY_FILE", "").strip()
     key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY", "").strip()
+    drive_impersonate_user = os.getenv("GOOGLE_DRIVE_IMPERSONATE_USER", "").strip()
 
     if credentials_path:
         credentials = service_account.Credentials.from_service_account_file(
@@ -49,6 +50,10 @@ def get_drive_access_token() -> str:
         raise RuntimeError(
             "Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided."
         )
+
+    if drive_impersonate_user:
+        # Why: shared drive writes may require domain user delegation on CI.
+        credentials = credentials.with_subject(drive_impersonate_user)
 
     credentials.refresh(Request())
     if not credentials.token:
@@ -79,6 +84,26 @@ def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
     )
     response.raise_for_status()
     return response.json()
+
+
+def ensure_drive_folder_writable(token: str, folder_id: str) -> None:
+    response = requests.get(
+        f"{DRIVE_API_BASE}/files/{folder_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "fields": "id,name,mimeType,capabilities(canAddChildren)",
+            "supportsAllDrives": "true",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    can_add_children = bool(data.get("capabilities", {}).get("canAddChildren"))
+    if not can_add_children:
+        raise RuntimeError(
+            "Drive folder is not writable by current credentials. "
+            f"folder_id={folder_id}, folder_name={data.get('name', '')}"
+        )
 
 
 def find_original_video_blob(storage_client, bucket_name: str, prefix: str, job_id: str):
@@ -186,6 +211,13 @@ def upload_text_asset(
         files=files,
         timeout=300,
     )
+    if response.status_code == 403:
+        message = response.text[:1000]
+        raise RuntimeError(
+            "Google Drive upload was forbidden (HTTP 403). "
+            "Verify that the service account (or delegated user) has editor permission "
+            f"for folder_id={folder_id}. Response={message}"
+        )
     response.raise_for_status()
     data = response.json()
     file_id = data.get("id")
@@ -249,6 +281,7 @@ def main() -> None:
     original_video_id = f"gs://{gcs_bucket}/{source_blob.name}"
 
     token = get_drive_access_token()
+    ensure_drive_folder_writable(token, folder_text_assets)
     print(f"Source video selected: {source_name} ({original_video_id})")
 
     with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
