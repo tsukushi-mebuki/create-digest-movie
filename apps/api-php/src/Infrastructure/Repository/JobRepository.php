@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace App\Infrastructure\Repository;
 
 use App\Domain\Job\JobStatus;
+use App\Domain\Job\StateGuard;
 use App\Infrastructure\Db\PdoFactory;
 use App\Support\Uuid;
+use InvalidArgumentException;
 use PDO;
 
 final class JobRepository
@@ -219,5 +221,139 @@ final class JobRepository
             'created_at' => $row['created_at'],
             'updated_at' => $row['updated_at'],
         ];
+    }
+
+    /**
+     * Why: Dispatch must be exactly-once per job_id and guarded by DB status.
+     *
+     * @param callable(string):void $dispatch
+     */
+    public function dispatchIfAllowed(string $jobId, callable $dispatch): string
+    {
+        $this->pdo->beginTransaction();
+
+        try {
+            $stmt = $this->pdo->prepare('SELECT status FROM video_jobs WHERE job_id = :job_id FOR UPDATE');
+            $stmt->execute([':job_id' => $jobId]);
+            $row = $stmt->fetch();
+
+            if ($row === false) {
+                $this->pdo->rollBack();
+                return 'not_found';
+            }
+
+            $currentStatus = (string) $row['status'];
+            if (!in_array($currentStatus, [JobStatus::PENDING, JobStatus::UPLOADING], true)) {
+                $this->pdo->rollBack();
+                return 'skipped';
+            }
+
+            $dispatch($jobId);
+
+            $update = $this->pdo->prepare('UPDATE video_jobs SET status = :status WHERE job_id = :job_id');
+            $update->execute([
+                ':status' => JobStatus::ANALYZING,
+                ':job_id' => $jobId,
+            ]);
+
+            $this->pdo->commit();
+            return 'dispatched';
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Why: Webhook retries/out-of-order deliveries must never overwrite terminal states.
+     *
+     * @param array<string,mixed>|null $incomingAssets
+     */
+    public function applyWebhookUpdate(string $jobId, string $incomingStatus, ?array $incomingAssets, ?string $completedAt): string
+    {
+        $this->pdo->beginTransaction();
+
+        try {
+            $stmt = $this->pdo->prepare('SELECT status, assets FROM video_jobs WHERE job_id = :job_id FOR UPDATE');
+            $stmt->execute([':job_id' => $jobId]);
+            $row = $stmt->fetch();
+
+            if ($row === false) {
+                $this->pdo->rollBack();
+                return 'not_found';
+            }
+
+            $currentStatus = (string) $row['status'];
+            if (
+                in_array($currentStatus, [JobStatus::COMPLETED, JobStatus::FAILED], true)
+                && in_array($incomingStatus, [JobStatus::ANALYZING, JobStatus::EDITING], true)
+            ) {
+                $this->pdo->rollBack();
+                return 'skipped';
+            }
+
+            try {
+                StateGuard::assertTransitionAllowed($currentStatus, $incomingStatus);
+            } catch (InvalidArgumentException) {
+                $this->pdo->rollBack();
+                return 'skipped';
+            }
+
+            $currentAssets = null;
+            if ($row['assets'] !== null) {
+                $decoded = json_decode((string) $row['assets'], true);
+                $currentAssets = is_array($decoded) ? $decoded : null;
+            }
+
+            $mergedAssets = $this->mergeAssets($currentAssets, $incomingAssets);
+
+            $resolvedCompletedAt = $completedAt;
+            if ($incomingStatus === JobStatus::COMPLETED && $resolvedCompletedAt === null) {
+                $resolvedCompletedAt = gmdate('Y-m-d H:i:s');
+            }
+
+            $update = $this->pdo->prepare(<<<'SQL'
+                UPDATE video_jobs
+                SET status = :next_status,
+                    assets = :assets,
+                    completed_at = CASE WHEN :status_for_completed = :status_completed THEN :completed_at ELSE completed_at END
+                WHERE job_id = :job_id
+            SQL);
+            $update->execute([
+                ':next_status' => $incomingStatus,
+                ':assets' => $mergedAssets === null ? null : json_encode($mergedAssets, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                ':status_for_completed' => $incomingStatus,
+                ':status_completed' => JobStatus::COMPLETED,
+                ':completed_at' => $resolvedCompletedAt,
+                ':job_id' => $jobId,
+            ]);
+
+            $this->pdo->commit();
+            return 'updated';
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * @param array<string,mixed>|null $current
+     * @param array<string,mixed>|null $incoming
+     * @return array<string,mixed>|null
+     */
+    private function mergeAssets(?array $current, ?array $incoming): ?array
+    {
+        if ($incoming === null) {
+            return $current;
+        }
+        if ($current === null) {
+            return $incoming;
+        }
+
+        return array_replace_recursive($current, $incoming);
     }
 }

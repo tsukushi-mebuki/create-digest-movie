@@ -3,3 +3,62 @@ name: cleanup-originals
 on:
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Cleanup threshold days by completed_at"
+        required: false
+        default: "7"
+      cleanup_batch_limit:
+        description: "Max jobs processed per run"
+        required: false
+        default: "200"
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      GOOGLE_OAUTH_ACCESS_TOKEN: ${{ secrets.GOOGLE_OAUTH_ACCESS_TOKEN }}
+      RETENTION_DAYS: ${{ github.event.inputs.retention_days || '7' }}
+      CLEANUP_BATCH_LIMIT: ${{ github.event.inputs.cleanup_batch_limit || '200' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build and start containers
+        run: docker compose up -d --build db api
+
+      - name: Wait for DB health
+        run: |
+          db_container_id=$(docker compose ps -q db)
+          if [ -z "$db_container_id" ]; then
+            echo "DB container not found"
+            docker compose ps
+            docker compose logs db
+            exit 1
+          fi
+
+          for i in {1..30}; do
+            status=$(docker inspect --format='{{.State.Health.Status}}' "$db_container_id" || true)
+            if [ "$status" = "healthy" ]; then
+              echo "DB is healthy"
+              exit 0
+            fi
+            echo "Current DB health status: ${status:-unknown}"
+            sleep 2
+          done
+          echo "DB did not become healthy in time"
+          docker compose ps
+          docker compose logs db
+          exit 1
+
+      - name: Run originals cleanup batch
+        run: docker compose exec -T api php /var/www/scripts/cleanup_originals.php
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -75,6 +75,91 @@ jobs:
           docker compose logs api
           exit 1
 
+      - name: Run Issue #3 quality tests
+        run: |
+          for i in {1..10}; do
+            if docker compose exec -T api php /var/www/tests/run_issue3_quality_tests.php; then
+              exit 0
+            fi
+            echo "Issue #3 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #3 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
+      - name: Run Issue #4 quality tests
+        run: |
+          for i in {1..10}; do
+            if docker compose exec -T api php /var/www/tests/run_issue4_quality_tests.php; then
+              exit 0
+            fi
+            echo "Issue #4 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #4 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
+      - name: Run Issue #8 quality tests
+        run: |
+          for i in {1..10}; do
+            if docker compose exec -T api php /var/www/tests/run_issue8_quality_tests.php; then
+              exit 0
+            fi
+            echo "Issue #8 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #8 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
+      - name: Setup Python for Issue #5 quality tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies for Issue #5 quality tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv tenacity
+
+      - name: Run Issue #5 quality tests
+        run: |
+          for i in {1..5}; do
+            if python pipelines/tests/run_issue5_quality_tests.py; then
+              exit 0
+            fi
+            echo "Issue #5 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #5 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
+      - name: Run Issue #6 quality tests
+        run: |
+          for i in {1..5}; do
+            if python pipelines/tests/run_issue6_quality_tests.py; then
+              exit 0
+            fi
+            echo "Issue #6 quality tests failed on attempt ${i}. Retrying in 3 seconds..."
+            sleep 3
+          done
+          echo "Issue #6 quality tests failed after retries"
+          docker compose ps
+          docker compose logs db
+          docker compose logs api
+          exit 1
+
       - name: Run Drive connectivity smoke test
         run: |
           for i in {1..5}; do

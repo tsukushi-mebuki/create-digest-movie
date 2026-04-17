@@ -1,1 +1,6 @@
-# Add pipeline dependencies in Issue #5 / #6.
+faster-whisper
+google-auth
+google-cloud-storage
+python-dotenv
+requests
+tenacity
