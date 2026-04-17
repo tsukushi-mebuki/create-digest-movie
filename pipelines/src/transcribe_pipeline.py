@@ -14,11 +14,6 @@ from dotenv import load_dotenv
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
-DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-
-
 class RetryableWebhookError(Exception):
     pass
 
@@ -28,37 +23,6 @@ def required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
-
-def get_drive_access_token() -> str:
-    from google.auth.transport.requests import Request
-    from google.oauth2 import service_account
-
-    credentials_path = os.getenv("GCP_SERVICE_ACCOUNT_KEY_FILE", "").strip()
-    key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY", "").strip()
-    drive_impersonate_user = os.getenv("GOOGLE_DRIVE_IMPERSONATE_USER", "").strip()
-
-    if credentials_path:
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_path, scopes=[DRIVE_SCOPE]
-        )
-    elif key_json:
-        credentials = service_account.Credentials.from_service_account_info(
-            json.loads(key_json), scopes=[DRIVE_SCOPE]
-        )
-    else:
-        raise RuntimeError(
-            "Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided."
-        )
-
-    if drive_impersonate_user:
-        # Why: shared drive writes may require domain user delegation on CI.
-        credentials = credentials.with_subject(drive_impersonate_user)
-
-    credentials.refresh(Request())
-    if not credentials.token:
-        raise RuntimeError("Failed to mint Google Drive access token.")
-    return credentials.token
 
 
 def get_storage_client():
@@ -73,37 +37,6 @@ def get_storage_client():
         return storage.Client.from_service_account_info(json.loads(key_json))
 
     raise RuntimeError("Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided.")
-
-
-def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def ensure_drive_folder_writable(token: str, folder_id: str) -> None:
-    response = requests.get(
-        f"{DRIVE_API_BASE}/files/{folder_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        params={
-            "fields": "id,name,mimeType,capabilities(canAddChildren)",
-            "supportsAllDrives": "true",
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    can_add_children = bool(data.get("capabilities", {}).get("canAddChildren"))
-    if not can_add_children:
-        raise RuntimeError(
-            "Drive folder is not writable by current credentials. "
-            f"folder_id={folder_id}, folder_name={data.get('name', '')}"
-        )
 
 
 def find_original_video_blob(storage_client, bucket_name: str, prefix: str, job_id: str):
@@ -188,42 +121,15 @@ def format_srt_time(seconds: float) -> str:
 
 
 def upload_text_asset(
-    token: str,
-    folder_id: str,
+    storage_client,
+    bucket_name: str,
+    object_name: str,
     file_path: Path,
     mime_type: str,
-    app_properties: dict[str, str] | None = None,
 ) -> str:
-    metadata = {
-        "name": file_path.name,
-        "parents": [folder_id],
-    }
-    if app_properties:
-        metadata["appProperties"] = app_properties
-    files = {
-        "metadata": ("metadata", json.dumps(metadata), "application/json"),
-        "file": (file_path.name, file_path.read_bytes(), mime_type),
-    }
-    response = requests.post(
-        DRIVE_UPLOAD_API,
-        headers={"Authorization": f"Bearer {token}"},
-        params={"supportsAllDrives": "true"},
-        files=files,
-        timeout=300,
-    )
-    if response.status_code == 403:
-        message = response.text[:1000]
-        raise RuntimeError(
-            "Google Drive upload was forbidden (HTTP 403). "
-            "Verify that the service account (or delegated user) has editor permission "
-            f"for folder_id={folder_id}. Response={message}"
-        )
-    response.raise_for_status()
-    data = response.json()
-    file_id = data.get("id")
-    if not isinstance(file_id, str) or not file_id:
-        raise RuntimeError("Failed to upload text asset to Drive.")
-    return file_id
+    blob = storage_client.bucket(bucket_name).blob(object_name)
+    blob.upload_from_filename(str(file_path), content_type=mime_type)
+    return f"gs://{bucket_name}/{object_name}"
 
 
 def sign_webhook_payload(secret: str, timestamp: str, payload_bytes: bytes) -> str:
@@ -272,7 +178,9 @@ def main() -> None:
     webhook_secret = required_env("WEBHOOK_SECRET")
     gcs_bucket = required_env("GCS_UPLOAD_BUCKET")
     gcs_prefix = os.getenv("GCS_UPLOAD_PREFIX", "originals")
-    folder_text_assets = required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
+    gcs_text_assets_prefix = os.getenv("GCS_TEXT_ASSETS_PREFIX", "text-assets").strip("/")
+    required_env("DRIVE_FOLDER_01_ORIGINAL")
+    required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
     required_env("DRIVE_FOLDER_03_COMPLETED_SHORTS")
 
     storage_client = get_storage_client()
@@ -280,8 +188,6 @@ def main() -> None:
     source_name = Path(source_blob.name).name or f"{job_id}.mp4"
     original_video_id = f"gs://{gcs_bucket}/{source_blob.name}"
 
-    token = get_drive_access_token()
-    ensure_drive_folder_writable(token, folder_text_assets)
     print(f"Source video selected: {source_name} ({original_video_id})")
 
     with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
@@ -307,21 +213,21 @@ def main() -> None:
         srt_path.write_text(srt_text, encoding="utf-8")
 
         srt_id = upload_text_asset(
-            token,
-            folder_text_assets,
+            storage_client,
+            gcs_bucket,
+            f"{gcs_text_assets_prefix}/{job_id}/transcript.srt",
             srt_path,
             "application/x-subrip",
-            {"job_id": job_id},
         )
         json_id = upload_text_asset(
-            token,
-            folder_text_assets,
+            storage_client,
+            gcs_bucket,
+            f"{gcs_text_assets_prefix}/{job_id}/transcript.json",
             json_path,
             "application/json",
-            {"job_id": job_id},
         )
-        print(f"Uploaded transcript.srt to Drive: {srt_id}")
-        print(f"Uploaded transcript.json to Drive: {json_id}")
+        print(f"Uploaded transcript.srt to GCS: {srt_id}")
+        print(f"Uploaded transcript.json to GCS: {json_id}")
 
     payload = build_webhook_payload(job_id, original_video_id, json_id)
     post_webhook_with_retry(webhook_url, webhook_secret, payload)
