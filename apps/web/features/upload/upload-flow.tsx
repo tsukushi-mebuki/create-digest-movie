@@ -1,13 +1,10 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
-import Uppy from "@uppy/core";
-import Tus from "@uppy/tus";
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { dispatchJob, initJob } from "@/apps/web/lib/api-client/jobs";
 import {
   ACCEPTED_VIDEO_EXTENSIONS,
-  HASH_CHUNK_SIZE_BYTES,
   MAX_VIDEO_SIZE_BYTES,
 } from "@/apps/web/lib/constants/upload";
 import { validateVideoFile } from "@/apps/web/features/upload/upload-validation";
@@ -34,6 +31,52 @@ type Toast = {
   kind: "success" | "error";
   message: string;
 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function uploadToDriveResumable(
+  uploadUrl: string,
+  file: File,
+  onProgress: (progress: number) => void
+): Promise<void> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", uploadUrl, true);
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable || event.total <= 0) {
+            return;
+          }
+          onProgress(Math.round((event.loaded / event.total) * 100));
+        };
+        xhr.onerror = () => reject(new Error("Failed to fetch"));
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            onProgress(100);
+            resolve();
+            return;
+          }
+          reject(new Error(`HTTP ${xhr.status}`));
+        };
+        xhr.send(file);
+      });
+      return;
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        throw new Error(
+          `動画アップロード通信に失敗しました。ネットワークを確認して再試行してください: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+      await sleep(attempt * 1000);
+    }
+  }
+}
 
 async function calculateSha256InWorker(file: File, onProgress: (progress: number) => void): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -73,7 +116,6 @@ export function UploadFlow() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
-  const uppyRef = useRef<Uppy | null>(null);
 
   const acceptedExtensionsText = useMemo(() => ACCEPTED_VIDEO_EXTENSIONS.join(","), []);
 
@@ -121,7 +163,6 @@ export function UploadFlow() {
 
       if (init.upload_url === null && init.status === "pending") {
         // Why: Partial duplicate must bypass upload and immediately continue analysis.
-        uppyRef.current?.cancelAll();
         await dispatchJob({ job_id: init.job_id });
         setToast({
           kind: "success",
@@ -136,45 +177,7 @@ export function UploadFlow() {
         return;
       }
 
-      const uppy = new Uppy({
-        autoProceed: true,
-        restrictions: {
-          maxNumberOfFiles: 1,
-          maxFileSize: MAX_VIDEO_SIZE_BYTES,
-          allowedFileTypes: [...ACCEPTED_VIDEO_EXTENSIONS],
-        },
-      });
-      uppy.use(Tus, {
-        endpoint: init.upload_url,
-        chunkSize: HASH_CHUNK_SIZE_BYTES,
-        retryDelays: [0, 1000, 3000, 5000],
-      });
-      uppyRef.current = uppy;
-
-      await new Promise<void>((resolve, reject) => {
-        uppy.on("upload-progress", (_file, progress) => {
-          if (!progress || !progress.bytesTotal) {
-            return;
-          }
-
-          setUploadProgress(Math.round((progress.bytesUploaded / progress.bytesTotal) * 100));
-        });
-        uppy.on("complete", () => {
-          uppy.destroy();
-          resolve();
-        });
-        uppy.on("error", (error) => {
-          uppy.destroy();
-          reject(error);
-        });
-
-        uppy.addFile({
-          name: selectedFile.name,
-          type: selectedFile.type,
-          data: selectedFile,
-        });
-        void uppy.upload();
-      });
+      await uploadToDriveResumable(init.upload_url as string, selectedFile, setUploadProgress);
 
       await dispatchJob({ job_id: init.job_id });
       router.push(`/job/${init.job_id}`);

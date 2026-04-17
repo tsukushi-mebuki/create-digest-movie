@@ -87,7 +87,7 @@ function handleInit(JobRepository $repository): void
     }
 
     $jobId = $repository->createPendingJob($fileHash, $normalizedSettingsHash, $originalFileName, $settings);
-    $uploadUrl = createDriveResumableUploadUrl($jobId, $originalFileName);
+    $uploadUrl = createGcsSignedUploadUrl($jobId, $originalFileName);
     respondJson(200, ['job_id' => $jobId, 'upload_url' => $uploadUrl, 'status' => JobStatus::PENDING]);
 }
 
@@ -279,164 +279,79 @@ function dispatchGithubWorkflowWithWorkflow(string $jobId, string $workflowEnvKe
 /**
  * Why: Service account key stays in env secret, and short-lived access token is minted on demand.
  */
-function createDriveResumableUploadUrl(string $jobId, string $originalFileName): string
+function createGcsSignedUploadUrl(string $jobId, string $originalFileName): string
 {
-    $accessToken = buildGoogleAccessToken();
-    $endpoint = getenv('GOOGLE_DRIVE_RESUMABLE_ENDPOINT');
-    if ($endpoint === false || $endpoint === '') {
-        $endpoint = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable';
-    }
-
-    $metadata = [
-        'name' => $originalFileName,
-        'appProperties' => ['job_id' => $jobId],
-    ];
-    $originalFolderId = getenv('DRIVE_FOLDER_01_ORIGINAL');
-    if ($originalFolderId !== false && trim($originalFolderId) !== '') {
-        // Why: pipeline-transcribe resolves source by job_id inside the originals folder.
-        $metadata['parents'] = [trim($originalFolderId)];
-    }
-
-    if (!function_exists('curl_init')) {
-        throw new \RuntimeException('cURL extension is required to create Drive resumable upload URL.');
-    }
-
-    $ch = curl_init($endpoint);
-    if ($ch === false) {
-        throw new \RuntimeException('Failed to initialize cURL for Drive upload URL creation.');
-    }
-
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => [
-            'Authorization: Bearer ' . $accessToken,
-            'Content-Type: application/json; charset=UTF-8',
-            'X-Upload-Content-Type: video/mp4',
-        ],
-        CURLOPT_POSTFIELDS => json_encode($metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-        CURLOPT_HEADER => true,
-        CURLOPT_RETURNTRANSFER => true,
-    ]);
-
-    $response = curl_exec($ch);
-    if ($response === false) {
-        $error = curl_error($ch);
-        curl_close($ch);
-        throw new \RuntimeException('Failed to create Drive resumable upload URL: ' . $error);
-    }
-
-    $statusCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $rawHeaders = substr($response, 0, $headerSize);
-    curl_close($ch);
-
-    if ($statusCode < 200 || $statusCode >= 300) {
-        throw new \RuntimeException('Drive resumable URL creation returned HTTP ' . $statusCode);
-    }
-
-    if (preg_match('/^Location:\s*(.+)\s*$/im', $rawHeaders, $matches) !== 1) {
-        throw new \RuntimeException('Drive resumable response did not include Location header.');
-    }
-
-    return trim($matches[1]);
-}
-
-function buildGoogleAccessToken(): string
-{
-    $rawServiceAccountKey = getenv('GCP_SERVICE_ACCOUNT_KEY');
-    if ($rawServiceAccountKey !== false && trim($rawServiceAccountKey) !== '') {
-        return createServiceAccountAccessToken($rawServiceAccountKey);
-    }
-
-    // Backward compatibility for local environments still using direct token injection.
-    return requiredEnv('GOOGLE_OAUTH_ACCESS_TOKEN');
-}
-
-function createServiceAccountAccessToken(string $rawServiceAccountKey): string
-{
+    $rawServiceAccountKey = requiredEnv('GCP_SERVICE_ACCOUNT_KEY');
     $serviceAccount = json_decode($rawServiceAccountKey, true);
     if (!is_array($serviceAccount)) {
         throw new \RuntimeException('GCP_SERVICE_ACCOUNT_KEY must be a valid JSON string.');
     }
-
     $clientEmail = $serviceAccount['client_email'] ?? null;
     $privateKey = $serviceAccount['private_key'] ?? null;
     if (!is_string($clientEmail) || !is_string($privateKey) || $clientEmail === '' || $privateKey === '') {
         throw new \RuntimeException('GCP_SERVICE_ACCOUNT_KEY is missing required fields.');
     }
 
-    $issuedAt = time();
-    $expiresAt = $issuedAt + 3600;
-    $header = ['alg' => 'RS256', 'typ' => 'JWT'];
-    $claims = [
-        'iss' => $clientEmail,
-        'scope' => 'https://www.googleapis.com/auth/drive.file',
-        'aud' => 'https://oauth2.googleapis.com/token',
-        'iat' => $issuedAt,
-        'exp' => $expiresAt,
-    ];
+    $bucket = requiredEnv('GCS_UPLOAD_BUCKET');
+    $prefix = getenv('GCS_UPLOAD_PREFIX');
+    if (!is_string($prefix) || trim($prefix) === '') {
+        $prefix = 'originals';
+    }
+    $objectName = trim($prefix, '/') . '/' . $jobId . '/' . sanitizeObjectName($originalFileName);
 
-    $encodedHeader = base64UrlEncode((string) json_encode($header, JSON_UNESCAPED_SLASHES));
-    $encodedClaims = base64UrlEncode((string) json_encode($claims, JSON_UNESCAPED_SLASHES));
-    $signingInput = $encodedHeader . '.' . $encodedClaims;
+    $now = gmdate('Ymd\THis\Z');
+    $date = gmdate('Ymd');
+    $scope = $date . '/auto/storage/goog4_request';
+    $credential = $clientEmail . '/' . $scope;
+
+    $host = 'storage.googleapis.com';
+    $canonicalUri = '/' . rawurlencode($bucket) . '/' . implode('/', array_map('rawurlencode', explode('/', $objectName)));
+    $signedHeaders = 'host';
+    $canonicalHeaders = 'host:' . $host . "\n";
+    $expires = 900;
+
+    $query = [
+        'X-Goog-Algorithm' => 'GOOG4-RSA-SHA256',
+        'X-Goog-Credential' => $credential,
+        'X-Goog-Date' => $now,
+        'X-Goog-Expires' => (string) $expires,
+        'X-Goog-SignedHeaders' => $signedHeaders,
+    ];
+    ksort($query);
+    $canonicalQuery = http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+
+    $canonicalRequest = "PUT\n"
+        . $canonicalUri . "\n"
+        . $canonicalQuery . "\n"
+        . $canonicalHeaders . "\n"
+        . $signedHeaders . "\n"
+        . 'UNSIGNED-PAYLOAD';
+    $hashedCanonicalRequest = hash('sha256', $canonicalRequest);
+    $stringToSign = "GOOG4-RSA-SHA256\n" . $now . "\n" . $scope . "\n" . $hashedCanonicalRequest;
 
     $privateKeyResource = openssl_pkey_get_private($privateKey);
     if ($privateKeyResource === false) {
         throw new \RuntimeException('Failed to parse private key from GCP_SERVICE_ACCOUNT_KEY.');
     }
-
     $signature = '';
-    $signResult = openssl_sign($signingInput, $signature, $privateKeyResource, OPENSSL_ALGO_SHA256);
+    $signResult = openssl_sign($stringToSign, $signature, $privateKeyResource, OPENSSL_ALGO_SHA256);
     if (PHP_VERSION_ID < 80000) {
         openssl_free_key($privateKeyResource);
     }
     if ($signResult !== true) {
-        throw new \RuntimeException('Failed to sign JWT for Google OAuth token exchange.');
+        throw new \RuntimeException('Failed to sign GCS upload URL.');
     }
-
-    $jwtAssertion = $signingInput . '.' . base64UrlEncode($signature);
-    $postBody = http_build_query([
-        'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        'assertion' => $jwtAssertion,
-    ]);
-
-    $ch = curl_init('https://oauth2.googleapis.com/token');
-    if ($ch === false) {
-        throw new \RuntimeException('Failed to initialize cURL for token exchange.');
-    }
-
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
-        CURLOPT_POSTFIELDS => $postBody,
-        CURLOPT_RETURNTRANSFER => true,
-    ]);
-
-    $response = curl_exec($ch);
-    if ($response === false) {
-        $error = curl_error($ch);
-        curl_close($ch);
-        throw new \RuntimeException('Google token exchange request failed: ' . $error);
-    }
-
-    $statusCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
-    if ($statusCode < 200 || $statusCode >= 300) {
-        throw new \RuntimeException('Google token exchange returned HTTP ' . $statusCode);
-    }
-
-    $decoded = json_decode($response, true);
-    $accessToken = $decoded['access_token'] ?? null;
-    if (!is_string($accessToken) || $accessToken === '') {
-        throw new \RuntimeException('Google token exchange response missing access_token.');
-    }
-
-    return $accessToken;
+    $hexSignature = bin2hex($signature);
+    return 'https://' . $host . $canonicalUri . '?' . $canonicalQuery . '&X-Goog-Signature=' . $hexSignature;
 }
 
-function base64UrlEncode(string $value): string
+function sanitizeObjectName(string $name): string
 {
-    return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
+    $sanitized = preg_replace('/[^A-Za-z0-9._-]+/', '_', trim($name));
+    if (!is_string($sanitized) || $sanitized === '' || $sanitized === '.' || $sanitized === '..') {
+        return 'video.mp4';
+    }
+    return $sanitized;
 }
 
 function readJsonBody(): array

@@ -56,6 +56,20 @@ def get_drive_access_token() -> str:
     return credentials.token
 
 
+def get_storage_client():
+    from google.cloud import storage
+
+    credentials_path = os.getenv("GCP_SERVICE_ACCOUNT_KEY_FILE", "").strip()
+    if credentials_path:
+        return storage.Client.from_service_account_json(credentials_path)
+
+    key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY", "").strip()
+    if key_json:
+        return storage.Client.from_service_account_info(json.loads(key_json))
+
+    raise RuntimeError("Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided.")
+
+
 def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
     response = requests.get(
         url,
@@ -67,68 +81,13 @@ def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
-def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, Any]:
-    # Why: We bind the picked source file to job_id appProperties for idempotent matching.
-    scoped_query = (
-        f"'{folder_id}' in parents and trashed=false and "
-        f"appProperties has {{ key='job_id' and value='{job_id}' }}"
-    )
-    data = drive_get(
-        f"{DRIVE_API_BASE}/files",
-        token,
-        {
-            "q": scoped_query,
-            "fields": "files(id,name,size,mimeType,createdTime,parents)",
-            "orderBy": "createdTime desc",
-            "pageSize": 1,
-            "supportsAllDrives": "true",
-            "includeItemsFromAllDrives": "true",
-        },
-    )
-    files = data.get("files", [])
-    if files:
-        return files[0]
-
-    # Why: During local verification, uploads may land outside the configured folder.
-    # Fallback keeps the pipeline moving while still binding by job_id.
-    fallback_query = f"trashed=false and appProperties has {{ key='job_id' and value='{job_id}' }}"
-    fallback = drive_get(
-        f"{DRIVE_API_BASE}/files",
-        token,
-        {
-            "q": fallback_query,
-            "fields": "files(id,name,size,mimeType,createdTime,parents)",
-            "orderBy": "createdTime desc",
-            "pageSize": 1,
-            "supportsAllDrives": "true",
-            "includeItemsFromAllDrives": "true",
-        },
-    )
-    fallback_files = fallback.get("files", [])
-    if not fallback_files:
-        raise RuntimeError(f"No source video found in Drive for job_id={job_id}")
-    print("Source video was not in DRIVE_FOLDER_01_ORIGINAL; using fallback search by job_id.")
-    return fallback_files[0]
-
-
-def download_drive_file(token: str, file_id: str, destination: Path) -> None:
-    url = f"{DRIVE_API_BASE}/files/{file_id}"
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params={
-            "alt": "media",
-            "supportsAllDrives": "true",
-        },
-        stream=True,
-        timeout=600,
-    )
-    response.raise_for_status()
-
-    with destination.open("wb") as output:
-        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-            if chunk:
-                output.write(chunk)
+def find_original_video_blob(storage_client, bucket_name: str, prefix: str, job_id: str):
+    effective_prefix = prefix.strip("/")
+    target_prefix = f"{effective_prefix}/{job_id}/"
+    blobs = list(storage_client.list_blobs(bucket_name, prefix=target_prefix, max_results=1))
+    if not blobs:
+        raise RuntimeError(f"No source video found in gs://{bucket_name}/{target_prefix}")
+    return blobs[0]
 
 
 def extract_audio(video_path: Path, audio_path: Path) -> None:
@@ -279,14 +238,17 @@ def main() -> None:
     job_id = required_env("JOB_ID")
     webhook_url = required_env("WEBHOOK_URL")
     webhook_secret = required_env("WEBHOOK_SECRET")
-    folder_original = required_env("DRIVE_FOLDER_01_ORIGINAL")
+    gcs_bucket = required_env("GCS_UPLOAD_BUCKET")
+    gcs_prefix = os.getenv("GCS_UPLOAD_PREFIX", "originals")
     folder_text_assets = required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
     required_env("DRIVE_FOLDER_03_COMPLETED_SHORTS")
 
+    storage_client = get_storage_client()
+    source_blob = find_original_video_blob(storage_client, gcs_bucket, gcs_prefix, job_id)
+    source_name = Path(source_blob.name).name or f"{job_id}.mp4"
+    original_video_id = f"gs://{gcs_bucket}/{source_blob.name}"
+
     token = get_drive_access_token()
-    source = find_original_video(token, folder_original, job_id)
-    original_video_id = source["id"]
-    source_name = source["name"]
     print(f"Source video selected: {source_name} ({original_video_id})")
 
     with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
@@ -297,7 +259,7 @@ def main() -> None:
         json_path = temp_path / "transcript.json"
 
         before_free = shutil.disk_usage(temp_path).free
-        download_drive_file(token, original_video_id, video_path)
+        source_blob.download_to_filename(str(video_path))
         print(f"Downloaded source video: {video_path}")
 
         extract_audio(video_path, audio_path)

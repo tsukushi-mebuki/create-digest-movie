@@ -75,6 +75,20 @@ def get_drive_access_token() -> str:
     return credentials.token
 
 
+def get_storage_client():
+    from google.cloud import storage
+
+    credentials_path = os.getenv("GCP_SERVICE_ACCOUNT_KEY_FILE", "").strip()
+    if credentials_path:
+        return storage.Client.from_service_account_json(credentials_path)
+
+    key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY", "").strip()
+    if key_json:
+        return storage.Client.from_service_account_info(json.loads(key_json))
+
+    raise RuntimeError("Either GCP_SERVICE_ACCOUNT_KEY_FILE or GCP_SERVICE_ACCOUNT_KEY must be provided.")
+
+
 def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
     response = requests.get(
         url,
@@ -86,27 +100,13 @@ def drive_get(url: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
-def find_original_video(token: str, folder_id: str, job_id: str) -> dict[str, Any]:
-    query = (
-        f"'{folder_id}' in parents and trashed=false and "
-        f"appProperties has {{ key='job_id' and value='{job_id}' }}"
-    )
-    data = drive_get(
-        f"{DRIVE_API_BASE}/files",
-        token,
-        {
-            "q": query,
-            "fields": "files(id,name,size,mimeType,createdTime)",
-            "orderBy": "createdTime desc",
-            "pageSize": 1,
-            "supportsAllDrives": "true",
-            "includeItemsFromAllDrives": "true",
-        },
-    )
-    files = data.get("files", [])
-    if not files:
-        raise RuntimeError(f"No source video found in DRIVE_FOLDER_01_ORIGINAL for job_id={job_id}")
-    return files[0]
+def find_original_video_blob(storage_client, bucket_name: str, prefix: str, job_id: str):
+    effective_prefix = prefix.strip("/")
+    target_prefix = f"{effective_prefix}/{job_id}/"
+    blobs = list(storage_client.list_blobs(bucket_name, prefix=target_prefix, max_results=1))
+    if not blobs:
+        raise RuntimeError(f"No source video found in gs://{bucket_name}/{target_prefix}")
+    return blobs[0]
 
 
 def find_transcript_json(token: str, folder_id: str, job_id: str) -> dict[str, Any]:
@@ -321,14 +321,18 @@ def main() -> None:
     job_id = required_env("JOB_ID")
     webhook_url = required_env("WEBHOOK_URL")
     webhook_secret = required_env("WEBHOOK_SECRET")
-    folder_original = required_env("DRIVE_FOLDER_01_ORIGINAL")
+    gcs_bucket = required_env("GCS_UPLOAD_BUCKET")
+    gcs_prefix = os.getenv("GCS_UPLOAD_PREFIX", "originals")
     folder_text_assets = required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
     folder_completed = required_env("DRIVE_FOLDER_03_COMPLETED_SHORTS")
     short_count = optional_int_env("SHORT_COUNT", 3)
     max_duration = optional_float_env("SHORT_MAX_DURATION_SEC", 30.0)
 
+    storage_client = get_storage_client()
     token = get_drive_access_token()
-    source_video = find_original_video(token, folder_original, job_id)
+    source_blob = find_original_video_blob(storage_client, gcs_bucket, gcs_prefix, job_id)
+    source_name = Path(source_blob.name).name or f"{job_id}.mp4"
+    source_video = {"id": f"gs://{gcs_bucket}/{source_blob.name}", "name": source_name}
     transcript_json = find_transcript_json(token, folder_text_assets, job_id)
     print(f"Source video selected: {source_video['name']} ({source_video['id']})")
     print(f"Transcript selected: {transcript_json['name']} ({transcript_json['id']})")
@@ -340,7 +344,7 @@ def main() -> None:
         transcript_path = temp_path / "transcript.json"
         temp_files_to_cleanup: list[Path] = [video_path, transcript_path]
         try:
-            download_drive_file(token, source_video["id"], video_path)
+            source_blob.download_to_filename(str(video_path))
             download_drive_file(token, transcript_json["id"], transcript_path)
 
             segments, duration = load_segments(transcript_path)
