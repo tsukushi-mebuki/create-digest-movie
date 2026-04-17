@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import useSWR from "swr";
 import Link from "next/link";
 import { fetchJobDetail } from "@/apps/web/lib/api-client/jobs";
-import type { JobAssets, JobDetailResponse, JobStatus } from "@/apps/web/lib/schemas/jobs";
+import type { CompletedShortAsset, JobAssets, JobDetailResponse, JobStatus } from "@/apps/web/lib/schemas/jobs";
 
 const TERMINAL_STATUSES: JobStatus[] = ["completed", "failed"];
 const FAST_POLLING_MS = 5_000;
@@ -31,7 +31,31 @@ function buildShortDownloadHref(shortAsset: string): string {
     return shortAsset;
   }
 
+  if (shortAsset.startsWith("gs://")) {
+    const withoutScheme = shortAsset.slice("gs://".length);
+    const slashIndex = withoutScheme.indexOf("/");
+    if (slashIndex > 0) {
+      const bucket = withoutScheme.slice(0, slashIndex);
+      const objectPath = withoutScheme.slice(slashIndex + 1);
+      const encodedPath = objectPath
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      return `https://storage.googleapis.com/${encodeURIComponent(bucket)}/${encodedPath}`;
+    }
+  }
+
   return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(shortAsset)}`;
+}
+
+function extractShortAssetId(shortAsset: CompletedShortAsset): string | null {
+  if (typeof shortAsset === "string") {
+    return shortAsset;
+  }
+  if (shortAsset && typeof shortAsset === "object" && typeof shortAsset.drive_file_id === "string") {
+    return shortAsset.drive_file_id;
+  }
+  return null;
 }
 
 function getPollingInterval(data: JobDetailResponse | undefined, startedAtMs: number | null): number {
@@ -94,13 +118,20 @@ function ResultCard({ assets }: { assets: JobAssets | null }) {
             <p className="text-sm text-emerald-800">まだショート動画情報がありません。</p>
           ) : (
             <ul className="mt-2 list-disc space-y-1 pl-5">
-              {shorts.map((shortAsset) => (
-                <li key={shortAsset}>
-                  <a className="underline" href={buildShortDownloadHref(shortAsset)} target="_blank" rel="noreferrer">
-                    ダウンロード: {shortAsset}
-                  </a>
-                </li>
-              ))}
+              {shorts.map((shortAsset, index) => {
+                const shortAssetId = extractShortAssetId(shortAsset);
+                if (!shortAssetId) {
+                  return null;
+                }
+
+                return (
+                  <li key={`${shortAssetId}-${index}`}>
+                    <a className="underline" href={buildShortDownloadHref(shortAssetId)} target="_blank" rel="noreferrer">
+                      ダウンロード: {shortAssetId}
+                    </a>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>

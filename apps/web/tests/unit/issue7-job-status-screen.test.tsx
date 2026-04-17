@@ -82,6 +82,28 @@ describe("JobStatusScreen", () => {
     expect(screen.getByRole("link", { name: "再アップロードする" })).toHaveAttribute("href", "/");
   });
 
+  it("completed_shortsがオブジェクト配列でも成果物リンクを表示できる", () => {
+    swrState = {
+      isLoading: false,
+      data: buildJob("completed", {
+        completed_shorts: [
+          {
+            drive_file_id: "gs://create-digest-movie/completed-shorts/job-a/short_01.mp4",
+            start_sec: 0,
+            end_sec: 30,
+            duration_sec: 30,
+          },
+        ],
+      }),
+    };
+
+    render(<JobStatusScreen jobId="11111111-1111-1111-1111-111111111111" />);
+    expect(screen.getByRole("link", { name: /ダウンロード: gs:\/\/create-digest-movie\/completed-shorts\/job-a\/short_01\.mp4/ })).toHaveAttribute(
+      "href",
+      "https://storage.googleapis.com/create-digest-movie/completed-shorts/job-a/short_01.mp4"
+    );
+  });
+
   it("ポーリング間隔は60秒以内5秒・以降10秒で、終端状態で停止する", () => {
     const dateNowSpy = vi.spyOn(Date, "now");
     dateNowSpy.mockReturnValueOnce(1_000);

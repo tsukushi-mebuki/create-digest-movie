@@ -16,10 +16,19 @@ export type JobDispatchRequest = {
 
 export type JobStatus = "pending" | "uploading" | "analyzing" | "editing" | "completed" | "failed";
 
+export type CompletedShortAsset =
+  | string
+  | {
+      drive_file_id: string;
+      start_sec?: number;
+      end_sec?: number;
+      duration_sec?: number;
+    };
+
 export type JobAssets = {
   original_video_id?: string;
   text_asset_id?: string;
-  completed_shorts?: string[];
+  completed_shorts?: CompletedShortAsset[];
   transcript_text?: string;
 };
 
