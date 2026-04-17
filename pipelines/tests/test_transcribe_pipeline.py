@@ -43,12 +43,13 @@ class TranscribePipelineTests(unittest.TestCase):
         self.assertEqual(expected, actual)
 
     def test_build_webhook_payload_uses_contract_shape(self) -> None:
-        payload = tp.build_webhook_payload("job-1", "video-1", "text-1")
+        payload = tp.build_webhook_payload("job-1", "video-1", "text-1", "https://signed.example/text.json")
 
         self.assertEqual("job-1", payload["job_id"])
         self.assertEqual("editing", payload["status"])
         self.assertEqual("video-1", payload["assets"]["original_video_id"])
         self.assertEqual("text-1", payload["assets"]["text_asset_id"])
+        self.assertEqual("https://signed.example/text.json", payload["assets"]["text_asset_url"])
         self.assertEqual({"job_id", "status", "assets"}, set(payload.keys()))
 
     def test_report_disk_space_logs_free_space(self) -> None:
@@ -66,7 +67,7 @@ class TranscribePipelineTests(unittest.TestCase):
         self.assertIn("Freed space check passed", printed)
 
     def test_post_webhook_with_retry_retries_on_503_and_sends_headers(self) -> None:
-        payload = tp.build_webhook_payload("job-xyz", "video-id", "text-id")
+        payload = tp.build_webhook_payload("job-xyz", "video-id", "text-id", "https://signed.example/text.json")
         captured_calls = []
         responses = [FakeResponse(503), FakeResponse(503), FakeResponse(200)]
 

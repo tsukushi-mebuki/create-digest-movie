@@ -58,6 +58,18 @@ function extractShortAssetId(shortAsset: CompletedShortAsset): string | null {
   return null;
 }
 
+function extractShortAssetSignedUrl(shortAsset: CompletedShortAsset): string | null {
+  if (
+    shortAsset &&
+    typeof shortAsset === "object" &&
+    typeof shortAsset.signed_url === "string" &&
+    shortAsset.signed_url.length > 0
+  ) {
+    return shortAsset.signed_url;
+  }
+  return null;
+}
+
 function getPollingInterval(data: JobDetailResponse | undefined, startedAtMs: number | null): number {
   if (data && isTerminalStatus(data.status)) {
     return 0;
@@ -105,6 +117,7 @@ function ResultCard({ assets }: { assets: JobAssets | null }) {
   const shorts = assets?.completed_shorts ?? [];
   const transcript = assets?.transcript_text;
   const transcriptAssetId = assets?.text_asset_id;
+  const transcriptAssetUrl = assets?.text_asset_url;
 
   return (
     <section className="rounded-lg border border-emerald-200 bg-emerald-50 p-5">
@@ -126,7 +139,12 @@ function ResultCard({ assets }: { assets: JobAssets | null }) {
 
                 return (
                   <li key={`${shortAssetId}-${index}`}>
-                    <a className="underline" href={buildShortDownloadHref(shortAssetId)} target="_blank" rel="noreferrer">
+                    <a
+                      className="underline"
+                      href={extractShortAssetSignedUrl(shortAsset) ?? buildShortDownloadHref(shortAssetId)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
                       ダウンロード: {shortAssetId}
                     </a>
                   </li>
@@ -142,6 +160,10 @@ function ResultCard({ assets }: { assets: JobAssets | null }) {
             <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-emerald-300 bg-white p-3 text-sm">
               {transcript}
             </pre>
+          ) : transcriptAssetUrl ? (
+            <a className="text-sm text-emerald-800 underline" href={transcriptAssetUrl} target="_blank" rel="noreferrer">
+              文字起こしJSONをダウンロード
+            </a>
           ) : transcriptAssetId ? (
             <p className="text-sm text-emerald-800">文字起こしアセットID: {transcriptAssetId}</p>
           ) : (

@@ -20,6 +20,7 @@ export type CompletedShortAsset =
   | string
   | {
       drive_file_id: string;
+      signed_url?: string;
       start_sec?: number;
       end_sec?: number;
       duration_sec?: number;
@@ -28,6 +29,7 @@ export type CompletedShortAsset =
 export type JobAssets = {
   original_video_id?: string;
   text_asset_id?: string;
+  text_asset_url?: string;
   completed_shorts?: CompletedShortAsset[];
   transcript_text?: string;
 };

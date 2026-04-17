@@ -89,6 +89,7 @@ describe("JobStatusScreen", () => {
         completed_shorts: [
           {
             drive_file_id: "gs://create-digest-movie/completed-shorts/job-a/short_01.mp4",
+            signed_url: "https://signed.example/short_01.mp4",
             start_sec: 0,
             end_sec: 30,
             duration_sec: 30,
@@ -100,7 +101,7 @@ describe("JobStatusScreen", () => {
     render(<JobStatusScreen jobId="11111111-1111-1111-1111-111111111111" />);
     expect(screen.getByRole("link", { name: /ダウンロード: gs:\/\/create-digest-movie\/completed-shorts\/job-a\/short_01\.mp4/ })).toHaveAttribute(
       "href",
-      "https://storage.googleapis.com/create-digest-movie/completed-shorts/job-a/short_01.mp4"
+      "https://signed.example/short_01.mp4"
     );
   });
 

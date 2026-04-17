@@ -146,16 +146,25 @@ def upload_completed_short(
     return f"gs://{bucket_name}/{object_name}"
 
 
+def generate_download_signed_url(storage_client, bucket_name: str, object_name: str, ttl_seconds: int) -> str:
+    blob = storage_client.bucket(bucket_name).blob(object_name)
+    return blob.generate_signed_url(version="v4", expiration=ttl_seconds, method="GET")
+
+
 def normalize_short_payload_item(item: dict[str, Any]) -> dict[str, Any]:
     start_sec = round(float(item["start_sec"]), 3)
     end_sec = round(float(item["end_sec"]), 3)
     duration_sec = round(float(item["duration_sec"]), 3)
-    return {
+    normalized: dict[str, Any] = {
         "drive_file_id": item["drive_file_id"],
         "start_sec": start_sec,
         "end_sec": end_sec,
         "duration_sec": duration_sec,
     }
+    signed_url = item.get("signed_url")
+    if isinstance(signed_url, str) and signed_url:
+        normalized["signed_url"] = signed_url
+    return normalized
 
 
 def build_webhook_payload(job_id: str, completed_shorts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -217,6 +226,7 @@ def main() -> None:
     gcs_prefix = os.getenv("GCS_UPLOAD_PREFIX", "originals")
     gcs_text_assets_prefix = os.getenv("GCS_TEXT_ASSETS_PREFIX", "text-assets").strip("/")
     gcs_completed_prefix = os.getenv("GCS_COMPLETED_SHORTS_PREFIX", "completed-shorts").strip("/")
+    signed_url_ttl_seconds = int(os.getenv("SIGNED_URL_TTL_SECONDS", "86400"))
     required_env("DRIVE_FOLDER_02_TEXT_ASSETS")
     required_env("DRIVE_FOLDER_03_COMPLETED_SHORTS")
     short_count = optional_int_env("SHORT_COUNT", 3)
@@ -263,6 +273,9 @@ def main() -> None:
                 completed_shorts.append(
                     {
                         "drive_file_id": drive_file_id,
+                        "signed_url": generate_download_signed_url(
+                            storage_client, gcs_bucket, object_name, signed_url_ttl_seconds
+                        ),
                         "start_sec": start_sec,
                         "end_sec": end_sec,
                         "duration_sec": end_sec - start_sec,
